@@ -8,12 +8,10 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const port = process.env.PORT || 5001;
 
-// Configurar CORS para permitir el origen del frontend en vivo
 app.use(cors({
-    origin: 'https://detodo.onrender.com' // <-- MODIFICADO: URL de tu frontend en Render
+    origin: 'https://detodo.onrender.com'
 }));
 
-// Middleware para procesar JSON solo en rutas que no son el webhook
 app.use((req, res, next) => {
   if (req.originalUrl === '/api/webhook') {
     next();
@@ -21,14 +19,13 @@ app.use((req, res, next) => {
     express.json()(req, res, next);
   }
 });
-// Servir archivos estáticos de las imágenes
+
 app.use('/uploads', express.static('uploads'));
 
 const uri = process.env.MONGODB_URI;
-// Agrega los parámetros TLS directamente a la URL de conexión
-const mongoURI = `${uri}&tls=true&tlsInsecure=true`;
 
-const client = new MongoClient(mongoURI);
+// CORRECCIÓN: Usar la URI directamente desde las variables de entorno
+const client = new MongoClient(uri);
 
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
@@ -44,6 +41,8 @@ const upload = multer({ storage: storage });
 async function run() {
     try {
         await client.connect();
+        console.log("Conectado a MongoDB Atlas!"); // Mensaje de éxito
+
         const db = client.db('detodo');
         const usersCollection = db.collection('users');
         const productsCollection = db.collection('products');
@@ -51,7 +50,10 @@ async function run() {
         const brandsCollection = db.collection('brands');
 
         const backendUrl = process.env.BACKEND_URL;
-
+        
+        // El resto del código de rutas...
+        // ...
+        
         // Middleware de Autenticación simple
         const checkAuth = (req, res, next) => {
             const userId = req.headers['x-user-id']; 
@@ -90,7 +92,7 @@ async function run() {
 
             const newUser = {
                 email,
-                password, // ADVERTENCIA: Usar bcrypt para hashear en producción
+                password, 
                 username: username || email.split('@')[0],
                 hasActiveSubscription: false,
                 createdAt: new Date(),
@@ -109,7 +111,7 @@ async function run() {
 
         app.post('/api/auth/signin', async (req, res) => {
             const { email, password } = req.body;
-            const user = await usersCollection.findOne({ email, password }); // ADVERTENCIA: Comparar hash en producción
+            const user = await usersCollection.findOne({ email, password }); 
 
             if (user) {
                 const userResponse = {
