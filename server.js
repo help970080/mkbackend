@@ -1,263 +1,429 @@
-const express = require('express');
-const cors = require('cors');
-const { MongoClient, ObjectId } = require('mongodb');
-const multer = require('multer');
-require('dotenv').config();
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const express = require("express");
+const cors = require("cors");
+const { MongoClient, ObjectId } = require("mongodb");
+const multer = require("multer");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const path = require("path");
+const bodyParser = require("body-parser");
+require("dotenv").config();
+const checkEnv = require("./checkEnv"); // Verificador de env
+checkEnv(); // Valida antes de arrancar
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? require("stripe")(process.env.STRIPE_SECRET_KEY)
+  : null;
 
 const app = express();
 const port = process.env.PORT || 5001;
 
-app.use(cors({
-    origin: 'https://detodo.onrender.com'
-}));
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
 
+// Webhook requiere raw
 app.use((req, res, next) => {
-  if (req.originalUrl === '/api/webhook') {
-    next();
-  } else {
-    express.json()(req, res, next);
-  }
+  if (req.originalUrl === "/api/webhook") next();
+  else express.json()(req, res, next);
 });
 
-app.use('/uploads', express.static('uploads'));
+// Archivos estáticos
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
+// DB
 const uri = process.env.MONGODB_URI;
-
-// CORRECCIÓN: Usar la URI directamente desde las variables de entorno
 const client = new MongoClient(uri);
 
+// Multer
 const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, './uploads');
-    },
-    filename: function (req, file, cb) {
-        cb(null, Date.now() + '-' + file.originalname);
-    }
+  destination: (_, __, cb) => cb(null, "./uploads"),
+  filename: (_, file, cb) =>
+    cb(null, Date.now() + "-" + file.originalname),
 });
+const upload = multer({ storage });
 
-const upload = multer({ storage: storage });
+// Helpers
+const BACKEND_URL =
+  process.env.BACKEND_URL || `http://localhost:${port}`;
+const JWT_SECRET = process.env.JWT_SECRET;
 
-async function run() {
+const signToken = (user) =>
+  jwt.sign(
+    {
+      uid: user._id.toString(),
+      email: user.email,
+      role: user.role || "user",
+    },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+
+const authRequired = (req, res, next) => {
+  const hdr = req.headers.authorization || "";
+  const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
+  if (!token) return res.status(401).json({ message: "Token requerido" });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.auth = payload;
+    next();
+  } catch {
+    res.status(401).json({ message: "Token inválido o expirado" });
+  }
+};
+
+async function bootstrap() {
+  await client.connect();
+  const db = client.db("detodo");
+  const Users = db.collection("users");
+  const Products = db.collection("products");
+  const Messages = db.collection("messages");
+  const Trades = db.collection("trades");
+  const Brands = db.collection("brands");
+
+  // -------------------------
+  // AUTH
+  // -------------------------
+  app.post("/api/auth/signup", async (req, res) => {
     try {
-        await client.connect();
-        console.log("Conectado a MongoDB Atlas!"); // Mensaje de éxito
+      const { email, password, username } = req.body || {};
+      if (!email || !password)
+        return res.status(400).json({ message: "Email y password requeridos" });
 
-        const db = client.db('detodo');
-        const usersCollection = db.collection('users');
-        const productsCollection = db.collection('products');
-        const messagesCollection = db.collection('messages');
-        const brandsCollection = db.collection('brands');
+      const exists = await Users.findOne({ email });
+      if (exists)
+        return res.status(400).json({ message: "El correo ya está registrado" });
 
-        const backendUrl = process.env.BACKEND_URL;
-        
-        // El resto del código de rutas...
-        // ...
-        
-        // Middleware de Autenticación simple
-        const checkAuth = (req, res, next) => {
-            const userId = req.headers['x-user-id']; 
-            if (userId) {
-                req.userId = userId;
-                next();
-            } else {
-                res.status(401).json({ message: 'No autenticado' });
-            }
-        };
-
-        // Middleware para verificar la suscripción del usuario
-        const checkSubscription = async (req, res, next) => {
-            if (!req.userId) return res.status(401).json({ message: 'No autenticado' });
-
-            try {
-                const user = await usersCollection.findOne({ _id: new ObjectId(req.userId) });
-                if (user && user.hasActiveSubscription) {
-                    req.user = user;
-                    next();
-                } else {
-                    res.status(403).json({ message: 'Se requiere una suscripción activa para realizar esta acción.' });
-                }
-            } catch (error) {
-                res.status(500).json({ message: 'Error al verificar suscripción' });
-            }
-        };
-
-        // RUTAS DE AUTENTICACIÓN
-        app.post('/api/auth/signup', async (req, res) => {
-            const { email, password, username } = req.body;
-            const existingUser = await usersCollection.findOne({ email });
-            if (existingUser) {
-                return res.status(400).json({ message: 'El correo ya está registrado.' });
-            }
-
-            const newUser = {
-                email,
-                password, 
-                username: username || email.split('@')[0],
-                hasActiveSubscription: false,
-                createdAt: new Date(),
-            };
-
-            const result = await usersCollection.insertOne(newUser);
-            const userResponse = {
-                uid: result.insertedId.toString(),
-                email: newUser.email,
-                username: newUser.username,
-                hasActiveSubscription: newUser.hasActiveSubscription,
-            };
-
-            res.status(201).json({ user: userResponse, message: 'Registro exitoso.', ok: true });
-        });
-
-        app.post('/api/auth/signin', async (req, res) => {
-            const { email, password } = req.body;
-            const user = await usersCollection.findOne({ email, password }); 
-
-            if (user) {
-                const userResponse = {
-                    uid: user._id.toString(),
-                    email: user.email,
-                    username: user.username,
-                    hasActiveSubscription: user.hasActiveSubscription,
-                };
-                res.json({ user: userResponse, message: 'Inicio de sesión exitoso.', ok: true });
-            } else {
-                res.status(401).json({ message: 'Credenciales inválidas.', ok: false });
-            }
-        });
-
-        // RUTAS DE PRODUCTOS
-        app.post('/api/products/add', checkAuth, checkSubscription, upload.array('imageFiles', 5), async (req, res) => {
-            const { name, description, price, condition } = req.body;
-            const images = req.files.map(file => `${backendUrl}/uploads/${file.filename}`);
-            const seller_id = req.userId;
-
-            const newProduct = {
-                name,
-                description,
-                price: parseFloat(price),
-                condition,
-                images,
-                seller_id,
-                is_sold: false,
-                createdAt: new Date(),
-            };
-
-            const result = await productsCollection.insertOne(newProduct);
-            res.status(201).json({ message: 'Producto agregado con éxito', productId: result.insertedId });
-        });
-
-        app.get('/api/products', async (req, res) => {
-            const products = await productsCollection.find({ is_sold: false }).sort({ createdAt: -1 }).limit(20).toArray();
-            res.json(products);
-        });
-
-        app.get('/api/products/by-user/:userId', async (req, res) => {
-            try {
-                const userId = req.params.userId;
-                const products = await productsCollection.find({ seller_id: userId }).sort({ createdAt: -1 }).toArray();
-                res.json(products);
-            } catch (error) {
-                res.status(400).json({ message: 'ID de usuario inválido' });
-            }
-        });
-
-        app.get('/api/products/:id', async (req, res) => {
-            try {
-                const id = new ObjectId(req.params.id);
-                const product = await productsCollection.findOne({ _id: id });
-
-                if (!product) {
-                    return res.status(404).json({ message: 'Producto no encontrado' });
-                }
-                res.json(product);
-            } catch (error) {
-                res.status(400).json({ message: 'ID de producto inválido' });
-            }
-        });
-
-        // RUTAS DE MENSAJES/PREGUNTAS
-        app.get('/api/messages/:productId', async (req, res) => {
-            try {
-                const productId = req.params.productId;
-                const messages = await messagesCollection.find({ productId }).sort({ createdAt: 1 }).toArray();
-                res.json(messages);
-            } catch (error) {
-                res.status(500).json({ message: 'Error al cargar mensajes' });
-            }
-        });
-
-        app.post('/api/messages/add', checkAuth, async (req, res) => {
-            const { productId, message, parentId } = req.body;
-            const senderId = req.userId;
-
-            const product = await productsCollection.findOne({ _id: new ObjectId(productId) });
-            const sender = await usersCollection.findOne({ _id: new ObjectId(senderId) });
-            
-            if (!product || !sender) {
-                return res.status(404).json({ message: 'Producto o usuario no encontrado.' });
-            }
-
-            const newMessage = {
-                productId,
-                senderId,
-                senderUsername: sender.username,
-                message,
-                parentId: parentId || null,
-                createdAt: new Date(),
-            };
-
-            await messagesCollection.insertOne(newMessage);
-            res.status(201).json({ message: 'Mensaje enviado' });
-        });
-
-        // RUTAS DE USUARIOS
-        app.get('/api/users/:id', async (req, res) => {
-            try {
-                const id = new ObjectId(req.params.id);
-                const user = await usersCollection.findOne({ _id: id });
-    
-                if (user) {
-                    res.json({ uid: user._id.toString(), email: user.email, username: user.username, hasActiveSubscription: user.hasActiveSubscription });
-                } else {
-                    res.status(404).json({ message: 'Usuario no encontrado' });
-                }
-            } catch (error) {
-                res.status(400).json({ message: 'ID de usuario inválido' });
-            }
-        });
-
-        // RUTAS DE STRIPE Y WEBHOOK
-        app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, res) => {
-            const signature = req.headers['stripe-signature'];
-            let event;
-            const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-            try {
-                event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
-            } catch (err) {
-                console.error(`Error de Webhook: ${err.message}`);
-                return res.status(400).send(`Webhook Error: ${err.message}`);
-            }
-
-            if (event.type === 'checkout.session.completed') {
-                const session = event.data.object;
-                const userId = session.client_reference_id;
-                await usersCollection.updateOne(
-                    { _id: new ObjectId(userId) },
-                    { $set: { hasActiveSubscription: true } }
-                );
-            }
-            res.status(200).end();
-        });
-
-        app.listen(port, () => {
-            console.log(`Servidor corriendo en el puerto: ${port}`);
-        });
-
-    } catch (err) {
-        console.error('Error de conexión a la base de datos:', err);
+      const hash = await bcrypt.hash(password, 10);
+      const userDoc = {
+        email,
+        password: hash,
+        username: (username || email.split("@")[0]).trim(),
+        hasActiveSubscription: false,
+        role: "user",
+        createdAt: new Date(),
+      };
+      const { insertedId } = await Users.insertOne(userDoc);
+      const user = { _id: insertedId, ...userDoc };
+      const token = signToken(user);
+      res.status(201).json({
+        ok: true,
+        message: "Registro exitoso",
+        token,
+        user: {
+          uid: insertedId.toString(),
+          email: user.email,
+          username: user.username,
+          hasActiveSubscription: user.hasActiveSubscription,
+          role: user.role,
+        },
+      });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ message: "Error en registro" });
     }
+  });
+
+  app.post("/api/auth/signin", async (req, res) => {
+    try {
+      const { email, password } = req.body || {};
+      const user = await Users.findOne({ email });
+      if (!user) return res.status(401).json({ message: "Credenciales inválidas" });
+      const ok = await bcrypt.compare(password, user.password);
+      if (!ok) return res.status(401).json({ message: "Credenciales inválidas" });
+
+      const token = signToken(user);
+      res.json({
+        ok: true,
+        message: "Inicio de sesión exitoso",
+        token,
+        user: {
+          uid: user._id.toString(),
+          email: user.email,
+          username: user.username,
+          hasActiveSubscription: user.hasActiveSubscription,
+          role: user.role || "user",
+        },
+      });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ message: "Error en inicio de sesión" });
+    }
+  });
+
+  app.get("/api/users/:uid", async (req, res) => {
+    try {
+      const _id = new ObjectId(req.params.uid);
+      const user = await Users.findOne({ _id }, { projection: { password: 0 } });
+      if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+      res.json(user);
+    } catch {
+      res.status(400).json({ message: "ID inválido" });
+    }
+  });
+
+  // -------------------------
+  // STRIPE WEBHOOK
+  // -------------------------
+  app.post(
+    "/api/webhook",
+    bodyParser.raw({ type: "application/json" }),
+    (req, res) => {
+      const sig = req.headers["stripe-signature"];
+      let event;
+      try {
+        event = stripe.webhooks.constructEvent(
+          req.body,
+          sig,
+          process.env.STRIPE_WEBHOOK_SECRET
+        );
+      } catch (err) {
+        console.error("⚠️ Error en webhook:", err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+      }
+
+      switch (event.type) {
+        case "checkout.session.completed":
+          console.log("✅ Pago completado");
+          break;
+        case "invoice.payment_failed":
+          console.log("❌ Pago fallido");
+          break;
+        default:
+          console.log(`Evento no manejado: ${event.type}`);
+      }
+
+      res.json({ received: true });
+    }
+  );
+
+  // -------------------------
+  // PRODUCTS
+  // -------------------------
+  app.post(
+    "/api/products/add",
+    authRequired,
+    upload.array("images", 5),
+    async (req, res) => {
+      try {
+        const { name, description, price, condition, currency, is_trade } =
+          req.body || {};
+        if (!name || !description || !price)
+          return res.status(400).json({ message: "Datos incompletos" });
+
+        const images = (req.files || []).map(
+          (f) => `${BACKEND_URL}/uploads/${f.filename}`
+        );
+        const doc = {
+          name,
+          description,
+          price: parseFloat(price),
+          condition,
+          currency: currency || "MXN",
+          images,
+          seller_id: req.auth.uid,
+          status: "disponible",
+          is_trade: Boolean(is_trade),
+          createdAt: new Date(),
+        };
+
+        const { insertedId } = await Products.insertOne(doc);
+        res
+          .status(201)
+          .json({ message: "Producto agregado", productId: insertedId });
+      } catch (e) {
+        console.error(e);
+        res.status(500).json({ message: "Error al agregar producto" });
+      }
+    }
+  );
+
+  app.get("/api/products", async (req, res) => {
+    try {
+      const { name, brand, minPrice, maxPrice } = req.query;
+      const q = { status: { $ne: "vendido" } };
+
+      if (name) q.name = { $regex: new RegExp(name, "i") };
+      if (brand) q.brand = brand;
+      if (minPrice || maxPrice) {
+        q.price = {};
+        if (minPrice) q.price.$gte = parseFloat(minPrice);
+        if (maxPrice) q.price.$lte = parseFloat(maxPrice);
+      }
+
+      const items = await Products.find(q).sort({ createdAt: -1 }).toArray();
+      res.json(items);
+    } catch (e) {
+      res.status(500).json({ message: "Error al listar productos" });
+    }
+  });
+
+  app.get("/api/products/:id", async (req, res) => {
+    try {
+      const _id = new ObjectId(req.params.id);
+      const product = await Products.findOne({ _id });
+      if (!product) return res.status(404).json({ message: "No encontrado" });
+      res.json(product);
+    } catch {
+      res.status(400).json({ message: "ID inválido" });
+    }
+  });
+
+  app.put("/api/products/sold/:id", authRequired, async (req, res) => {
+    try {
+      const _id = new ObjectId(req.params.id);
+      const p = await Products.findOne({ _id });
+      if (!p) return res.status(404).json({ message: "No encontrado" });
+      if (p.seller_id !== req.auth.uid)
+        return res.status(403).json({ message: "No autorizado" });
+
+      await Products.updateOne({ _id }, { $set: { status: "vendido" } });
+      res.json({ message: "Marcado como vendido" });
+    } catch {
+      res.status(400).json({ message: "ID inválido" });
+    }
+  });
+
+  app.delete("/api/products/:id", authRequired, async (req, res) => {
+    try {
+      const _id = new ObjectId(req.params.id);
+      const p = await Products.findOne({ _id });
+      if (!p) return res.status(404).json({ message: "No encontrado" });
+      if (p.seller_id !== req.auth.uid)
+        return res.status(403).json({ message: "No autorizado" });
+
+      await Products.deleteOne({ _id });
+      res.json({ message: "Eliminado" });
+    } catch {
+      res.status(400).json({ message: "ID inválido" });
+    }
+  });
+
+  // -------------------------
+  // MENSAJES
+  // -------------------------
+  app.get("/api/messages/by-product/:productId", async (req, res) => {
+    try {
+      const productId = req.params.productId;
+      const msgs = await Messages.find({ productId })
+        .sort({ createdAt: 1 })
+        .toArray();
+      res.json(msgs);
+    } catch {
+      res.status(500).json({ message: "Error al cargar mensajes" });
+    }
+  });
+
+  app.post("/api/messages", authRequired, async (req, res) => {
+    try {
+      const { productId, message } = req.body || {};
+      if (!productId || !message)
+        return res.status(400).json({ message: "Datos incompletos" });
+      const doc = {
+        productId,
+        senderId: req.auth.uid,
+        senderUsername: req.auth.email.split("@")[0],
+        message,
+        createdAt: new Date(),
+      };
+      const { insertedId } = await Messages.insertOne(doc);
+      res.status(201).json({ message: "OK", id: insertedId });
+    } catch {
+      res.status(500).json({ message: "Error al enviar mensaje" });
+    }
+  });
+
+  // -------------------------
+  // TRUEQUES
+  // -------------------------
+  app.post("/api/trades", authRequired, async (req, res) => {
+    try {
+      const { product_offered, product_requested } = req.body || {};
+      if (!product_offered || !product_requested)
+        return res.status(400).json({ message: "Datos incompletos" });
+
+      const offered = await Products.findOne({
+        _id: new ObjectId(product_offered),
+      });
+      const requested = await Products.findOne({
+        _id: new ObjectId(product_requested),
+      });
+      if (!offered || !requested)
+        return res.status(404).json({ message: "Producto no encontrado" });
+      if (offered.seller_id !== req.auth.uid)
+        return res
+          .status(403)
+          .json({ message: "No puedes ofrecer un producto que no es tuyo" });
+
+      const doc = {
+        product_offered,
+        product_requested,
+        proposer_id: req.auth.uid,
+        owner_id: requested.seller_id,
+        status: "pendiente",
+        createdAt: new Date(),
+      };
+      const { insertedId } = await Trades.insertOne(doc);
+      res.status(201).json({ message: "Propuesta enviada", tradeId: insertedId });
+    } catch {
+      res.status(500).json({ message: "Error al crear trueque" });
+    }
+  });
+
+  app.put("/api/trades/:id", authRequired, async (req, res) => {
+    try {
+      const _id = new ObjectId(req.params.id);
+      const { action } = req.body || {};
+      const t = await Trades.findOne({ _id });
+      if (!t) return res.status(404).json({ message: "Trueque no encontrado" });
+      if (t.owner_id !== req.auth.uid)
+        return res.status(403).json({ message: "No autorizado" });
+
+      if (!["aceptar", "rechazar"].includes(action))
+        return res.status(400).json({ message: "Acción inválida" });
+
+      const status = action === "aceptar" ? "aprobado" : "rechazado";
+      await Trades.updateOne({ _id }, { $set: { status } });
+
+      if (status === "aprobado") {
+        await Products.updateOne(
+          { _id: new ObjectId(t.product_offered) },
+          { $set: { status: "vendido" } }
+        );
+        await Products.updateOne(
+          { _id: new ObjectId(t.product_requested) },
+          { $set: { status: "vendido" } }
+        );
+      }
+
+      res.json({ message: `Trueque ${status}` });
+    } catch {
+      res.status(400).json({ message: "ID inválido" });
+    }
+  });
+
+  app.get("/api/trades/mine", authRequired, async (req, res) => {
+    const uid = req.auth.uid;
+    const list = await Trades.find({
+      $or: [{ proposer_id: uid }, { owner_id: uid }],
+    })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.json(list);
+  });
+
+  // -------------------------
+  // BRANDS
+  // -------------------------
+  app.get("/api/brands", async (_req, res) => {
+    const items = await Brands.find().sort({ name: 1 }).toArray();
+    res.json(items.map((b) => b.name || b));
+  });
+
+  app.listen(port, () =>
+    console.log(`🚀 Backend listo en http://localhost:${port}`)
+  );
 }
 
-run();
+bootstrap().catch((e) => {
+  console.error("Error al iniciar servidor:", e);
+  process.exit(1);
+});
