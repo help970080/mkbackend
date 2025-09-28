@@ -5,14 +5,7 @@ const multer = require("multer");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const path = require("path");
-const bodyParser = require("body-parser");
 require("dotenv").config();
-const checkEnv = require("./checkEnv"); // Verificador de env
-checkEnv(); // Valida antes de arrancar
-
-const stripe = process.env.STRIPE_SECRET_KEY
-  ? require("stripe")(process.env.STRIPE_SECRET_KEY)
-  : null;
 
 const app = express();
 const port = process.env.PORT || 5001;
@@ -34,13 +27,8 @@ app.use(
   })
 );
 
-// Webhook requiere raw
-app.use((req, res, next) => {
-  if (req.originalUrl === "/api/webhook") next();
-  else express.json()(req, res, next);
-});
-
-// Archivos estáticos
+// Middlewares
+app.use(express.json());
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // DB
@@ -54,11 +42,8 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Helpers
-const BACKEND_URL =
-  process.env.BACKEND_URL || `http://localhost:${port}`;
+// JWT
 const JWT_SECRET = process.env.JWT_SECRET;
-
 const signToken = (user) =>
   jwt.sign(
     {
@@ -70,6 +55,7 @@ const signToken = (user) =>
     { expiresIn: "7d" }
   );
 
+// Middleware de autenticación
 const authRequired = (req, res, next) => {
   const hdr = req.headers.authorization || "";
   const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
@@ -84,23 +70,57 @@ const authRequired = (req, res, next) => {
 };
 
 // -------------------------
-// Resto de tu código igual
+// Bootstrap con rutas
 // -------------------------
-
 async function bootstrap() {
   await client.connect();
   const db = client.db("detodo");
+
   const Users = db.collection("users");
   const Products = db.collection("products");
   const Messages = db.collection("messages");
   const Trades = db.collection("trades");
   const Brands = db.collection("brands");
 
-  // (todas tus rutas se mantienen igual)
-  // ...
-  app.listen(port, () =>
-    console.log(`🚀 Backend listo en http://localhost:${port}`)
-  );
+  // -------------------------
+  // API: Productos
+  // -------------------------
+  app.get("/api/products", async (req, res) => {
+    try {
+      const items = await Products.find({}).toArray();
+      res.json(items);
+    } catch (err) {
+      console.error("Error obteniendo productos:", err);
+      res.status(500).json({ error: "Error interno al cargar productos" });
+    }
+  });
+
+  // Semilla opcional (ejecutar 1 vez y luego borrar)
+  app.post("/api/products/seed", async (req, res) => {
+    try {
+      const sample = [
+        { name: "Camiseta", price: 200, description: "Camiseta de algodón" },
+        { name: "Pantalón", price: 500, description: "Pantalón de mezclilla" },
+        { name: "Zapatos", price: 800, description: "Zapatos de piel" },
+      ];
+      await Products.insertMany(sample);
+      res.json({ message: "Productos iniciales insertados" });
+    } catch (err) {
+      res.status(500).json({ error: "Error al insertar productos" });
+    }
+  });
+
+  // -------------------------
+  // Otras rutas existentes (auth, users, etc.)
+  // -------------------------
+  // Aquí dejas tus otras rutas como ya las tienes configuradas
+
+  // -------------------------
+  // Iniciar servidor
+  // -------------------------
+  app.listen(port, () => {
+    console.log(`🚀 Backend listo en http://localhost:${port}`);
+  });
 }
 
 bootstrap().catch((e) => {
